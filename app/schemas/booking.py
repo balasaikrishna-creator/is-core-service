@@ -8,6 +8,7 @@ class BookingCreate(BaseModel):
     check_in: date
     check_out: date
     guests: int
+    status: str
 
 class BookingResponse(BookingCreate):
     id: int

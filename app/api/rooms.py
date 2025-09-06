@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.room import RoomResponse
@@ -9,4 +9,7 @@ router = APIRouter()
 
 @router.get("/hotel/{hotel_id}", response_model=List[RoomResponse])
 async def list_rooms(hotel_id: int, db: AsyncSession = Depends(get_db)):
-    return await HotelService.get_rooms_by_hotel(db, hotel_id)
+    rooms_data = await HotelService.get_rooms_by_hotel(db, hotel_id)
+    if rooms_data is None or len(rooms_data) == 0:
+        raise HTTPException(status_code=404, detail="Rooms not found in Hotel")
+    return rooms_data
