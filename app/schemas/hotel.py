@@ -14,7 +14,15 @@ class HotelBase(BaseModel):
     images: List[str]
 
 class HotelCreate(HotelBase):
-    pass
+    name: str
+    description: Optional[str]
+    city: str
+    country: str
+    price_min: float
+    price_max: float
+    rating: float
+    amenities: List[str]
+    images: List[str]
 
 class HotelResponse(HotelBase):
     id: int

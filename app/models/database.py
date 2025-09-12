@@ -50,6 +50,7 @@ class Room(Base):
     amenities = Column(ARRAY(String), default=[])
     available = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationship to Hotel
     hotel = relationship("Hotel", back_populates="rooms")
@@ -66,6 +67,7 @@ class Booking(Base):
     guests = Column(Integer, default=1)
     status = Column(String(32), default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships (optional, for access from ORM)
     user = relationship("User")      # via user_id

@@ -1,7 +1,8 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, delete, update
 from app.models.database import Hotel, Room
-from app.schemas.hotel import HotelResponse
+from app.schemas.hotel import HotelResponse, HotelCreate
+
 
 class HotelService:
     @staticmethod
@@ -24,7 +25,24 @@ class HotelService:
         return hotel_obj
 
     @staticmethod
-    async def get_rooms_by_hotel(db: AsyncSession, hotel_id: int):
-        query = select(Room).where(Room.hotel_id == hotel_id)
+    async def create_hotel(db: AsyncSession, hotel_data: HotelCreate):
+        new_hotel = Hotel(**hotel_data.dict())
+        db.add(new_hotel)
+        await db.commit()
+        await db.refresh(new_hotel)
+        return new_hotel
+
+    @staticmethod
+    async def delete_hotel_by_id(db: AsyncSession, hotel_id: int):
+        query = delete(Hotel).where(Hotel.id == hotel_id).returning(Hotel)
         result = await db.execute(query)
-        return result.scalars().all()
+        await db.commit()
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def update_hotel_by_id(db: AsyncSession, hotel_data: HotelCreate, hotel_id: int):
+        query = update(Hotel).where(Hotel.id == hotel_id).values(**hotel_data.dict()).returning(Hotel)
+        result = await db.execute(query)
+        await db.commit()
+        updated_hotel = result.scalar_one_or_none()
+        return updated_hotel

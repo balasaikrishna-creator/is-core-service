@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 from datetime import date
 
@@ -13,6 +15,12 @@ class BookingCreate(BaseModel):
 class BookingResponse(BookingCreate):
     id: int
     status: str
+    
+class BookingUpdate(BaseModel):
+    check_in: Optional[date] = None
+    check_out: Optional[date] = None
+    guests: Optional[int] = None
+    status: Optional[str] = 'Pending'
 
     class Config:
         from_attributes = True

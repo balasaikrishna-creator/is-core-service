@@ -1,7 +1,7 @@
 # File: app/services/user_service.py
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update, delete
 from passlib.context import CryptContext
 
 from app.models.database import User
@@ -14,16 +14,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 class UserService:
     @staticmethod
     async def create_user(db: AsyncSession, user_data: UserCreate) -> User:
-        """
-        Create a new user with hashed password.
-
-        Args:
-            db (AsyncSession): Database session.
-            user_data (UserCreate): Pydantic schema with user details.
-
-        Returns:
-            User: The created User ORM instance.
-        """
         hashed_password = pwd_context.hash(user_data.password)
         new_user = User(
             email=user_data.email,
@@ -38,17 +28,6 @@ class UserService:
 
     @staticmethod
     async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
-        """
-        Verify user credentials.
-
-        Args:
-            db (AsyncSession): Database session.
-            email (str): User's email.
-            password (str): Plaintext password to verify.
-
-        Returns:
-            User | None: The authenticated User ORM instance or None if invalid.
-        """
         result = await db.execute(select(User).where(User.email == email))
         user = result.scalar_one_or_none()
         if user and pwd_context.verify(password, user.password_hash):
@@ -57,20 +36,24 @@ class UserService:
 
     @staticmethod
     async def get_user_by_id(db: AsyncSession, user_id: int) -> User | None:
-        """
-        Fetch a user by their ID.
-
-        Args:
-            db (AsyncSession): Database session.
-            user_id (int): The user's primary key.
-
-        Returns:
-            User | None: The User ORM instance or None if not found.
-        """
         result = await db.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
 
     @staticmethod
     async def get_user_by_email(db, email: str):
         result = await db.execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def update_user_info(db: AsyncSession, user_id: int, user_data: User) -> User | None:
+        query = update(User).where(User.id == user_id).values(**user_data.dict()).returning(User)
+        result = await db.execute(query)
+        await db.commit()
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def delete_user_info(db: AsyncSession, user_id: int) -> User | None:
+        query = delete(User).where(User.id == user_id).returning(User)
+        result = await db.execute(query)
+        await db.commit()
         return result.scalar_one_or_none()
