@@ -1,8 +1,8 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, Date, ForeignKey, DECIMAL, ARRAY, Boolean
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
 from datetime import datetime
+
+from sqlalchemy import Column, Integer, String, Text, DateTime, Date, ForeignKey, DECIMAL, Boolean
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY
+from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
 
@@ -16,6 +16,8 @@ class User(Base):
     preferences = Column(JSONB, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    chat_sessions = relationship("ChatSession", back_populates="user")
 
 # Define Hotel, Room, Booking, ChatSession similarly...
 
@@ -73,3 +75,18 @@ class Booking(Base):
     user = relationship("User")      # via user_id
     hotel = relationship("Hotel")    # via hotel_id
     room = relationship("Room")      # via room_id
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"))
+    session_id = Column(String(255), unique=True, nullable=False, index=True)
+    messages = Column(JSONB, default=list)
+    context = Column(JSONB, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # relationships
+    user = relationship("User", back_populates="chat_sessions")

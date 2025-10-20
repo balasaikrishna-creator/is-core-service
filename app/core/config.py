@@ -1,7 +1,6 @@
-# File: app/core/config.py
-
 from pydantic_settings import BaseSettings
 from typing import List
+from pathlib import Path
 
 class Settings(BaseSettings):
     # Database
@@ -13,7 +12,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int
 
     # AI / Third-Party APIs
-    OPENAI_API_KEY: str
+    GOOGLE_GEMINI_API_KEY: str
     GOOGLE_MAPS_API_KEY: str
 
     # Payment (Braintree/PayPal)
@@ -26,6 +25,7 @@ class Settings(BaseSettings):
     DEBUG: bool = True
 
     class Config:
-        env_file = ".env"
+        env_file = str(Path(__file__).resolve().parents[2] / ".env")
+        env_file_encoding = "utf-8"
 
 settings = Settings()
