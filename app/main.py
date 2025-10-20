@@ -22,9 +22,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def on_startup():
-    # # Automatically create database tables
-    # async with get_async_session() as db:
-    #     await seed_hotels(db)
     await init_db()
 
 # Include your routers
