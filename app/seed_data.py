@@ -4,7 +4,7 @@ load_dotenv()
 
 import asyncio
 from app.core.database import AsyncSessionLocal
-from app.models.database import Hotel, Room
+from app.models.database import Hotel, Room, User
 
 async def seed():
     async with AsyncSessionLocal() as session:
@@ -23,6 +23,12 @@ async def seed():
             Room(hotel_id=hotels[1].id, room_type="Standard", price=90, amenities=["WiFi"]),
         ]
         session.add_all(rooms)
+
+        # Add a user with correct hotel IDs
+        user = [
+            User(id=1, email="bala@gmail.com", first_name='bala', last_name='gontla', password_hash='bala')
+        ]
+        session.add_all(user)
 
         await session.commit()  # Commit all changes
 

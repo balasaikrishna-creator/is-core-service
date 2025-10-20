@@ -1,17 +1,20 @@
+import os
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+
 import asyncio
 from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 from alembic import context
-from alembic.config import Config
 
 from app.core.config import settings       # Pydantic settings with DATABASE_URL
 from app.models.database import Base       # SQLAlchemy Base metadata
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
-config: Config = context.config
+config = context.config
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -52,13 +55,15 @@ def run_migrations_online():
 
     async def do_run_migrations():
         async with connectable.connect() as connection:
-            await connection.run_sync(
-                context.configure,
-                connection=connection,
-                target_metadata=target_metadata,
-                compare_type=True,
-            )
-            await connection.run_sync(context.run_migrations)
+            def do_configure(connection):
+                context.configure(
+                    connection=connection,
+                    target_metadata=target_metadata,
+                    compare_type=True,
+                )
+
+            await connection.run_sync(do_configure)
+            await connection.run_sync(lambda connection: context.run_migrations())
 
     asyncio.run(do_run_migrations())
 
