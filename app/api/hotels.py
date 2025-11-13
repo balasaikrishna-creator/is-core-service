@@ -19,7 +19,24 @@ async def search_hotels(
     data = await HotelService.search_hotels(db, city, min_price, max_price, rating)
     if data is None:
         raise HTTPException(status_code=404, detail="No Hotel data found")
-    return data
+    # Deduplicate preserving order: prefer id, fallback to (name, city)
+    seen_ids = set()
+    seen_keys = set()
+    deduped: List[HotelResponse] = []
+    for h in data:
+        hid = getattr(h, 'id', None)
+        if hid is not None:
+            if hid in seen_ids:
+                continue
+            seen_ids.add(hid)
+            deduped.append(h)
+        else:
+            key = (str(getattr(h, 'name', '')).strip().lower(), str(getattr(h, 'city', '')).strip().lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(h)
+    return deduped
 
 @router.get("/{hotel_id}", response_model=HotelResponse)
 async def get_hotel(hotel_id: int, db: AsyncSession = Depends(get_db)):

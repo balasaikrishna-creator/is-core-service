@@ -12,7 +12,16 @@ async def list_rooms(hotel_id: int, db: AsyncSession = Depends(get_db)):
     rooms_data = await RoomService.get_rooms_by_hotel(db, hotel_id)
     if rooms_data is None or len(rooms_data) == 0:
         raise HTTPException(status_code=404, detail="Rooms not found in Hotel")
-    return rooms_data
+    # Deduplicate by room id
+    seen = set()
+    deduped: List[RoomResponse] = []
+    for r in rooms_data:
+        rid = getattr(r, 'id', None)
+        if rid is None or rid in seen:
+            continue
+        seen.add(rid)
+        deduped.append(r)
+    return deduped
 
 @router.post("/hotel/{hotel_id}", response_model=RoomResponse)
 async def add_rooms(room: RoomCreate, hotel_id: int, db: AsyncSession = Depends(get_db)):

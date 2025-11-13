@@ -7,6 +7,7 @@ from datetime import datetime, date
 from typing import List, Dict, Any, Tuple, Optional
 
 import google.generativeai as genai
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, update, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,10 @@ from app.core.config import settings
 from app.models.database import ChatSession, Hotel, Room
 from app.schemas.chat import ChatMessageRequest, ChatResponse, HotelRecommendation
 from app.services.booking_service import BookingService
+from app.schemas.booking import BookingUpdate
+from app.core.database import get_db
+
+router = APIRouter(tags=["Chat"])
 
 
 class AIService:
@@ -21,10 +26,10 @@ class AIService:
         genai.configure(api_key=settings.GOOGLE_GEMINI_API_KEY)
         self.model = genai.GenerativeModel("models/gemini-2.5-flash")
         self.openings = [
-            "Good news! I found some hotels in {location} with pools:",
-            "Here are a few great pool-equipped hotels in {location}:",
-            "I’ve got some poolside hotel options for you in {location}:",
-            "Take a look at these hotels in {location} that feature pools:"
+            "Good news! I found some hotels in {location} matching your preferences:",
+            "Here are a few great options in {location}:",
+            "I’ve got some hotel recommendations for you in {location}:",
+            "Take a look at these hotels in {location}:"
         ]
         self.closings = [
             "Would you like more details on any of these?",
@@ -68,31 +73,102 @@ class AIService:
             if name == "book_room":
                 success, payload = await self._handle_book_intent(db, chat_session, context, request.user_id, target, details)
                 if success:
+                    # Created as pending; ask user to confirm to mark as Confirmed
+                    summary = self._format_booking_summary(payload)
                     assistant_text = (
-                        f"Booking confirmed: {payload.get('hotel', {}).get('name')} in "
-                        f"{payload.get('hotel', {}).get('city')}. Booking id: {payload.get('booking_id')}."
+                        f"I created a pending booking:\n{summary}\n\n"
+                        "Would you like me to confirm this booking now? Reply 'confirm' to proceed or 'no' to keep it pending."
                     )
                     new_context = dict(context)
                     new_context["booking"] = payload
+                    new_context["pending_confirmation"] = payload.get("booking_id")
+                    new_context.pop("pending_booking", None)
                     await self._update_session(db, chat_session, request.message, assistant_text, new_context)
                     return ChatResponse(response=assistant_text, session_id=session_id, recommendations=[], conversation_context=new_context)
                 else:
+                    # Persist pending booking state so follow-up messages (e.g., just dates) can complete the flow
+                    new_context = dict(context)
+                    new_context["pending_booking"] = True
+                    for k, v in (details or {}).items():
+                        if v is not None:
+                            new_context[k] = v
                     assistant_text = payload.get("error", "Could not create booking. Please provide missing details.")
-                    await self._update_session(db, chat_session, request.message, assistant_text, context)
-                    return ChatResponse(response=assistant_text, session_id=session_id, recommendations=[], conversation_context=context)
+                    await self._update_session(db, chat_session, request.message, assistant_text, new_context)
+                    return ChatResponse(response=assistant_text, session_id=session_id, recommendations=[], conversation_context=new_context)
+
+            if name == "confirm_booking":
+                bid = (context or {}).get("pending_confirmation")
+                if not bid:
+                    text = "There's no booking awaiting confirmation."
+                    await self._update_session(db, chat_session, request.message, text, context)
+                    return ChatResponse(response=text, session_id=session_id, recommendations=[], conversation_context=context)
+                ok, res = await self._set_booking_status(db, bid, "Confirmed")
+                if ok:
+                    text = f"Your booking #{bid} has been confirmed. Have a great stay!"
+                    new_context = dict(context)
+                    new_context["booking"] = {**(new_context.get("booking") or {}), "status": "Confirmed", "booking_id": bid}
+                    new_context.pop("pending_confirmation", None)
+                    await self._update_session(db, chat_session, request.message, text, new_context)
+                    return ChatResponse(response=text, session_id=session_id, recommendations=[], conversation_context=new_context)
+                else:
+                    text = res.get("error", "Could not confirm the booking right now.")
+                    await self._update_session(db, chat_session, request.message, text, context)
+                    return ChatResponse(response=text, session_id=session_id, recommendations=[], conversation_context=context)
+
+            if name == "decline_booking":
+                bid = (context or {}).get("pending_confirmation")
+                text = "Okay, I will leave the booking as pending. You can confirm later."
+                new_context = dict(context)
+                new_context.pop("pending_confirmation", None)
+                await self._update_session(db, chat_session, request.message, text, new_context)
+                return ChatResponse(response=text, session_id=session_id, recommendations=[], conversation_context=new_context)
+
+        # If a booking is pending and user supplied follow-up info (like dates), try again
+        if (context or {}).get("pending_booking"):
+            updated_context = await self._extract_context(db, request.message, chat_session)
+            success, payload = await self._handle_book_intent(db, chat_session, updated_context, request.user_id, None, {})
+            if success:
+                summary = self._format_booking_summary(payload)
+                assistant_text = (
+                    f"I created a pending booking:\n{summary}\n\n"
+                    "Would you like me to confirm this booking now? Reply 'confirm' to proceed or 'no' to keep it pending."
+                )
+                updated_context["booking"] = payload
+                updated_context["pending_confirmation"] = payload.get("booking_id")
+                updated_context.pop("pending_booking", None)
+                await self._update_session(db, chat_session, request.message, assistant_text, updated_context)
+                return ChatResponse(response=assistant_text, session_id=session_id, recommendations=[], conversation_context=updated_context)
 
         # Otherwise attempt recommendations
         recommendations = await self._get_recommendations(db, context)
         if recommendations:
-            opening = random.choice(self.openings).format(location=context.get('location', 'that area'))
+            # Avoid echoing generic query as location string
+            raw_loc = (context.get('location') or '').strip()
+            loc_l = raw_loc.lower()
+            bad_loc = raw_loc == '' or (any(w in loc_l for w in ["find", "hotel", "with", "pool"]) and len(loc_l.split()) > 2)
+            opening_loc = 'that area' if bad_loc else raw_loc
+            opening = random.choice(self.openings).format(location=opening_loc)
             closing = random.choice(self.closings)
             rec_text = opening + "\n\n"
-            for h in recommendations:
+            for idx, h in enumerate(recommendations, start=1):
                 desc = h.description or "No description available."
-                rec_text += f"- {h.name} ({h.rating}★) – {h.price_range}\n  {desc}\n\n"
+                city_part = f" — {h.city}" if getattr(h, 'city', None) else ""
+                rec_text += (
+                    f"{idx}. {h.name}{city_part} ({h.rating}★)\n"
+                    f"   - Price range: {h.price_range}\n"
+                    f"   - {desc}\n\n"
+                )
             rec_text += closing
-            await self._update_session(db, chat_session, request.message, rec_text, context)
-            return ChatResponse(response=rec_text, session_id=session_id, recommendations=recommendations, conversation_context=context)
+            # Store last recommendations for follow-up references like 'there'
+            new_ctx = dict(context or {})
+            new_ctx['last_recommendations'] = [
+                {"id": h.id, "name": h.name, "city": h.city}
+                for h in recommendations
+            ]
+            if recommendations:
+                new_ctx['last_hotel_id'] = recommendations[0].id
+            await self._update_session(db, chat_session, request.message, rec_text, new_ctx)
+            return ChatResponse(response=rec_text, session_id=session_id, recommendations=recommendations, conversation_context=new_ctx)
 
         # No DB recommendations - ask Gemini for fallback
         fallback_raw = await self._handle_no_recommendations(chat_session, request.message, context)
@@ -140,13 +216,28 @@ class AIService:
         ctx = dict(chat_session.context or {})
         loc = self._extract_location(message)
         if loc:
-            ctx["location"] = loc
+            # Skip generic phrases like 'find hotel with pool' from becoming the location
+            loc_l = loc.strip().lower()
+            if not (any(w in loc_l for w in ["find", "hotel", "with", "pool"]) and len(loc_l.split()) > 2):
+                ctx["location"] = loc
         dates = self._extract_dates(message)
         if dates:
             ctx.update(dates)
         prefs = self._extract_preferences(message)
         if prefs:
-            ctx.setdefault("preferences", {}).update(prefs)
+            pref_store = ctx.setdefault("preferences", {})
+            # If current message explicitly mentioned amenities, overwrite existing ones
+            if prefs.get("_amenities_explicit"):
+                if "amenities" in pref_store:
+                    pref_store.pop("amenities", None)
+                # If no new location was extracted in this turn, drop old location to broaden search
+                if not loc and ctx.get("location"):
+                    ctx.pop("location", None)
+            # Merge/overwrite other keys
+            for k, v in prefs.items():
+                if k.startswith("_"):
+                    continue
+                pref_store[k] = v
         guests = self._extract_guest_count(message)
         if guests:
             ctx.setdefault("preferences", {})["guests"] = guests
@@ -155,17 +246,35 @@ class AIService:
     def _extract_location(self, message: str) -> Optional[str]:
         if not message:
             return None
-        patterns = [r"in\s+([A-Z][\w\s]+)", r"at\s+([A-Z][\w\s]+)", r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b"]
+        # Prefer explicitly quoted names (handles straight and smart quotes)
+        mquote = re.search(r"[\"'“”‘’]([^\"'“”‘’]+)[\"'“”‘’]", message)
+        if mquote:
+            return mquote.group(1).strip()
+        # Case-insensitive patterns to catch names like 'in grand plaza' but stop before dates/guest tokens
+        # Stop tokens: on|from|to|until|through|for or a digit (dates)
+        stop = r"(?=\s+(?:on|from|to|until|through|for)\b|\s+\d|$)"
+        patterns = [
+            rf"\bin\s+([a-zA-Z][\w\s&\.'\-]*?){stop}",
+            rf"\bat\s+([a-zA-Z][\w\s&\.'\-]*?){stop}",
+            # Fallback: a capitalized multi-word name, but still stop at tokens/numbers
+            rf"\b([A-Z][\w\s&\.'\-]+?){stop}"
+        ]
         for pat in patterns:
-            m = re.search(pat, message)
+            m = re.search(pat, message, flags=re.IGNORECASE)
             if m:
                 candidate = m.group(1).strip()
+                # Reject generic query phrases that aren't locations
+                cand_l = candidate.lower()
+                bad_tokens = ["find", "hotel", "with", "pool", "book", "rooms", "room"]
+                if any(t in cand_l for t in bad_tokens) and not re.match(r"^[A-Z]", candidate.strip()):
+                    continue
                 return candidate
         # fallback common city names
-        known = ["New York", "Los Angeles", "Chicago", "Miami", "Seattle", "Brooklyn"]
+        known = ["new york", "los angeles", "chicago", "miami", "seattle", "brooklyn"]
+        ml = message.lower()
         for city in known:
-            if city.lower() in message.lower():
-                return city
+            if city in ml:
+                return city.title()
         return None
 
     def _extract_dates(self, message: str) -> Dict[str, Any]:
@@ -207,12 +316,23 @@ class AIService:
             except Exception:
                 pass
         ml = message.lower()
-        if any(w in ml for w in ['cheap', 'budget', 'affordable', 'inexpensive']):
+        if any(w in ml for w in ['cheap', 'budget', 'affordable', 'inexpensive', 'lowest price', 'lowest cost', 'cheapest']):
             prefs["price_level"] = "budget"
-        elif any(w in ml for w in ['luxury', 'premium', 'expensive', 'high-end']):
-            prefs["price_level"] = "luxury"
+            prefs["sort"] = "price_asc"
+        elif any(w in ml for w in ['luxury', 'premium', 'expensive', 'high-end', 'costliest', 'most expensive', 'highest price']):
+            prefs["price_level"] = prefs.get("price_level") or "luxury"
+            prefs["sort"] = "price_desc"
         elif any(w in ml for w in ['mid-range', 'moderate']):
             prefs["price_level"] = "mid"
+
+        # Room type from free text
+        if any(w in ml for w in ['standard room', 'standard']):
+            prefs["room_type"] = "standard"
+        elif any(w in ml for w in ['deluxe room', 'deluxe']):
+            prefs["room_type"] = "deluxe"
+        elif any(w in ml for w in ['suite room', 'suite']):
+            prefs["room_type"] = "suite"
+
         if any(w in ml for w in ['western', 'indian', 'chinese', 'italian', 'mexican']):
             prefs["restaurant_pref"] = next((w for w in ['western', 'indian', 'chinese', 'italian', 'mexican'] if w in ml), None)
         amenities = []
@@ -228,6 +348,11 @@ class AIService:
                 amenities.append(amen)
         if amenities:
             prefs["amenities"] = amenities
+            prefs["_amenities_explicit"] = True
+
+        # Superlatives on amenities
+        if any(w in ml for w in ['maximum amenities', 'most amenities', 'highest amenities']):
+            prefs["sort"] = "amenities_desc"
         return prefs
 
     def _extract_guest_count(self, message: str) -> Optional[int]:
@@ -241,26 +366,163 @@ class AIService:
         return None
 
     async def _get_recommendations(self, db: AsyncSession, context: Dict[str, Any]) -> List[HotelRecommendation]:
+        # Base query by location (if any)
         q = select(Hotel)
-        if context.get("location"):
-            q = q.where(Hotel.city.ilike(f"%{context.get('location')}%"))
-        if context.get("preferences", {}).get("budget_min"):
+        location = context.get("location")
+        if location:
+            loc_l = str(location).strip().lower()
+            # If 'location' clearly looks like a generic query, ignore it
+            if not (any(w in loc_l for w in ["find", "hotel", "with", "pool"]) and len(loc_l.split()) > 2):
+                q = q.where(or_(Hotel.city.ilike(f"%{location}%"), Hotel.name.ilike(f"%{location}%")))
+
+        # Fetch a reasonably large set then filter in Python for flexible matching
+        res = await db.execute(q.limit(50))
+        hotels = list(res.scalars().all() or [])
+
+        prefs = context.get("preferences", {}) or {}
+        want_amenities = set(a.lower() for a in (prefs.get("amenities") or []))
+        budget_min = prefs.get("budget_min")
+        price_level = prefs.get("price_level")
+
+        # Optional room type preference
+        room_type_pref = None
+        for key in ["room_type", "Room", "Room Type", "roomType"]:
+            v = prefs.get(key) or context.get(key)
+            if isinstance(v, str) and v.strip():
+                room_type_pref = v.strip().lower()
+                break
+
+        # Python-side filters
+        filtered: List[Hotel] = []
+        for h in hotels:
+            # Price filtering
+            if budget_min is not None:
+                try:
+                    b = float(budget_min)
+                    if h.price_min > b:
+                        continue
+                except Exception:
+                    pass
+            if price_level == "budget" and h.price_max > 150:
+                continue
+            if price_level == "luxury" and h.price_min < 200:
+                continue
+
+            # Amenities filtering (subset)
+            if want_amenities:
+                h_amen = self._normalize_amenities(h.amenities)
+                if not want_amenities.issubset(h_amen):
+                    continue
+
+            filtered.append(h)
+
+        # If room_type specified, ensure at least one matching available room
+        if room_type_pref:
+            ensured: List[Hotel] = []
+            for h in filtered:
+                rq = select(Room).where(and_(Room.hotel_id == h.id, Room.available == True))
+                rres = await db.execute(rq)
+                rooms = rres.scalars().all()
+                if any((r.room_type or '').lower().find(room_type_pref) != -1 for r in rooms):
+                    ensured.append(h)
+            filtered = ensured
+
+        # De-duplicate by (name, city)
+        seen = set()
+        unique_hotels: List[Hotel] = []
+        for h in filtered:
+            key = (h.name.strip().lower(), h.city.strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_hotels.append(h)
+
+        # Sorting based on preferences
+        sort_pref = (prefs.get("sort") or "").lower()
+        if sort_pref == "price_asc":
+            unique_hotels.sort(key=lambda x: (float(getattr(x, 'price_min', 0) or 0), float(getattr(x, 'price_max', 0) or 0)))
+        elif sort_pref == "price_desc":
+            unique_hotels.sort(key=lambda x: float(getattr(x, 'price_max', 0) or 0), reverse=True)
+        elif sort_pref == "amenities_desc":
+            def amen_count(x: Hotel) -> int:
+                try:
+                    return len(self._normalize_amenities(x.amenities))
+                except Exception:
+                    return 0
+            unique_hotels.sort(key=amen_count, reverse=True)
+
+        # Map to schema with synthesized description if missing
+        out: List[HotelRecommendation] = []
+        for h in unique_hotels[:10]:
+            price_range = f"${h.price_min} - ${h.price_max}"
+            desc = h.description
+            if not desc:
+                amens = sorted(self._normalize_amenities(h.amenities))
+                amen = ", ".join(amens) or "amenities not listed"
+                desc = f"A {float(h.rating or 0):.1f}★ stay offering {amen}. Typical price range {price_range}."
+            # Try to attach an image URL if available on the model
+            img_url = None
             try:
-                b = float(context["preferences"]["budget_min"])
-                q = q.where(Hotel.price_min <= b)
+                imgs = getattr(h, "images", None)
+                if isinstance(imgs, list) and imgs:
+                    img_url = imgs[0]
+                elif isinstance(imgs, str) and imgs:
+                    img_url = imgs
             except Exception:
                 pass
-        res = await db.execute(q.limit(10))
-        hotels = res.scalars().all()
-        out: List[HotelRecommendation] = []
-        for h in hotels:
-            price_range = f"${h.price_min} - ${h.price_max}"
-            out.append(HotelRecommendation(id=h.id, name=h.name, city=h.city, rating=float(h.rating or 0), price_range=price_range, description=h.description, amenities=h.amenities))
+            out.append(HotelRecommendation(
+                id=h.id,
+                name=h.name,
+                city=h.city,
+                rating=float(h.rating or 0),
+                price_range=price_range,
+                description=desc,
+                amenities=h.amenities,
+                image_url=img_url
+            ))
         return out
+
+    def _normalize_amenities(self, amenities: Any) -> set[str]:
+        vals: list[str] = []
+        if not amenities:
+            return set()
+        if isinstance(amenities, list):
+            vals = [str(x) for x in amenities]
+        elif isinstance(amenities, str):
+            # Strip Postgres array-like string: {WiFi,Pool}
+            cleaned = amenities.strip().strip('{}')
+            if cleaned:
+                vals = [p.strip() for p in cleaned.split(',') if p.strip()]
+        else:
+            try:
+                vals = list(amenities)
+            except Exception:
+                vals = []
+        return set(v.lower() for v in vals)
 
     def _build_gpt_messages(self, user_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         # simple wrapper if needed for future
         return user_messages
+
+    async def _set_booking_status(self, db: AsyncSession, booking_id: int, status: str) -> Tuple[bool, Dict[str, Any]]:
+        try:
+            updated = await BookingService.update_booking_by_booking_id(db, BookingUpdate(status=status), booking_id)
+            if not updated:
+                return False, {"error": "Booking not found"}
+            return True, {"id": updated.id, "status": updated.status}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def _format_booking_summary(self, payload: Dict[str, Any]) -> str:
+        h = payload.get("hotel", {})
+        r = payload.get("room", {})
+        ci = payload.get("check_in", "")
+        co = payload.get("check_out", "")
+        g = payload.get("guests", "")
+        return (f"Hotel: {h.get('name', 'N/A')} — {h.get('city', '')}\n"
+                f"Room: {r.get('room_type', 'N/A')} — ${r.get('price', '')}\n"
+                f"Check-in: {ci}  Check-out: {co}\n"
+                f"Guests: {g}")
 
     async def _update_session(self, db: AsyncSession, session: ChatSession, user_message: str, assistant_message: str, context: Dict[str, Any]):
         messages = session.messages or []
@@ -350,18 +612,32 @@ class AIService:
     def _parse_date_fuzzy(self, text: str) -> Optional[date]:
         if not text or not isinstance(text, str):
             return None
+        # Normalize ordinal suffixes and commas
         txt = re.sub(r'(\d{1,2})(st|nd|rd|th)', r'\1', text, flags=re.IGNORECASE)
         txt = txt.replace(",", "").strip()
+        # Try common formats with year
         fmts = ["%B %d %Y", "%b %d %Y", "%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%m/%d/%Y", "%Y/%m/%d"]
         for fmt in fmts:
             try:
                 return datetime.strptime(txt, fmt).date()
             except Exception:
                 continue
+        # Try ISO parse directly
         try:
-            return datetime.fromisoformat(text.strip()).date()
+            return datetime.fromisoformat(txt).date()
         except Exception:
-            return None
+            pass
+        # Handle month-day without year (assume current year)
+        fmts_no_year = ["%b %d", "%B %d", "%d %b", "%d %B", "%m/%d"]
+        for fmt in fmts_no_year:
+            try:
+                dtemp = datetime.strptime(txt, fmt)
+                now = datetime.now()
+                inferred = dtemp.replace(year=now.year).date()
+                return inferred
+            except Exception:
+                continue
+        return None
 
     async def book_from_context(
         self,
@@ -393,7 +669,8 @@ class AIService:
         if preferred_hotel_id:
             q = select(Hotel).where(Hotel.id == preferred_hotel_id)
         else:
-            q = select(Hotel).where(Hotel.city.ilike(f"%{location}%"))
+            # Match by city OR hotel name to support prompts like 'Grand Plaza' (hotel name)
+            q = select(Hotel).where(or_(Hotel.city.ilike(f"%{location}%"), Hotel.name.ilike(f"%{location}%")))
             budget_min = context.get("preferences", {}).get("budget_min") or prefs.get("Budget") or prefs.get("Budget_min")
             if isinstance(budget_min, (int, float, str)):
                 try:
@@ -442,7 +719,12 @@ class AIService:
     def _detect_intent(self, message: str) -> Optional[Dict[str, Any]]:
         ml = message.lower()
         details = self._extract_booking_details_from_text(message)
-        booking_keywords = [r"\bbook\b", r"\breserve\b", r"\breservation\b", r"\bconfirm\b", r"\bhold\b"]
+        # Explicit confirm/decline intents first
+        if re.search(r"\b(?:confirm|yes|proceed|go ahead|ok)\b", ml):
+            return {"name": "confirm_booking", "target": None, "details": {}}
+        if re.search(r"\b(?:no|cancel|stop|not now|later)\b", ml):
+            return {"name": "decline_booking", "target": None, "details": {}}
+        booking_keywords = [r"\bbook\b", r"\breserve\b", r"\breservation\b", r"\bhold\b"]
         if any(re.search(k, ml) for k in booking_keywords):
             if re.search(r"\bcancel\b|\bdelete\b", ml):
                 return {"name": "cancel_booking", "target": None, "details": details}
@@ -463,7 +745,7 @@ class AIService:
         if re.search(r"\b(?:details about|tell me about|hotel details|amenit(?:y|ies)|rating|address|phone)\b", ml):
             target = details.get("hotel") or None
             return {"name": "hotel_details", "target": target, "details": details}
-        if re.search(r"\b(?:my booking|my bookings|current booking|reservations|show my reservations|what bookings)\b", ml):
+        if re.search(r"\b(?:my booking|my bookings|current booking|reservations|show my reservations|what bookings|my reservation|my reserved rooms|booked rooms|already booked|booking details|show my booked)\b", ml):
             return {"name": "current_booking", "target": None, "details": details}
         return None
 
@@ -471,28 +753,37 @@ class AIService:
         out: Dict[str, Any] = {}
         if not text or not isinstance(text, str):
             return out
-        quoted = re.search(r"\"([^\"]+)\"", text)
-        if quoted:
-            out["hotel"] = quoted.group(1).strip()
+        tl = text.lower()
+        # Pronoun resolution marker; handler will use context.last_hotel_id
+        if re.search(r"\bthere\b", tl):
+            out['pronoun_there'] = True
+
+        # Quoted target name
+        mquote = re.search(r'"([^"]+)"', text)
+        if mquote:
+            out["hotel"] = mquote.group(1).strip()
         else:
-            m_at = re.search(r"\bat\s+(?:the\s+)?([A-Z0-9][\w\s&\.'\-]+)", text)
+            # Patterns like 'at Grand Plaza' or 'in New York'
+            m_at = re.search(r"\b(?:at|in)\s+([A-Z0-9][\w\s&'\-]+)", text)
             if m_at:
                 out["hotel"] = m_at.group(1).strip()
-            else:
-                m_in = re.search(r"\bin\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", text)
-                if m_in:
-                    out["location"] = m_in.group(1).strip()
+
+        # Room type from free text
         room_keywords = ["single", "double", "suite", "deluxe", "standard", "king", "queen", "family", "studio", "executive"]
         for kw in room_keywords:
             if re.search(rf"\b{kw}\b", text, flags=re.IGNORECASE):
                 out.setdefault("room_type", kw)
                 break
+
+        # Budget
         m_budget = re.search(r"\$\s*([0-9]{2,7})", text)
         if m_budget:
             try:
                 out["budget_min"] = int(m_budget.group(1))
             except Exception:
                 pass
+
+        # Guests
         total_guests = 0
         m_guests = re.search(r"for\s+((?:\d+\s*(?:adults?|children?|kids?|people|persons|guests?)(?:\s*(?:and|,)\s*)?)+)", text, flags=re.IGNORECASE)
         if m_guests:
@@ -508,6 +799,8 @@ class AIService:
                 total_guests = int(m_for.group(1))
         if total_guests > 0:
             out["guests"] = total_guests
+
+        # Date range
         m_range = re.search(r"\bfrom\s+(.+?)\s+(?:to|until|through)\s+(.+?)(?:\b|$)", text, flags=re.IGNORECASE)
         if not m_range:
             m_range = re.search(r"((?:[A-Za-z]{3,9}\s*\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?))\s*(?:-|to|until|through)\s*((?:[A-Za-z]{3,9}\s*\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?))", text, flags=re.IGNORECASE)
@@ -541,26 +834,42 @@ class AIService:
             target = quoted.group(1).strip()
         elif m:
             target = m.group(1).strip()
-        elif context.get("location"):
-            target = context.get("location")
-        if not target:
-            return ("Which hotel or city would you like to see room types for?", context)
-        q = select(Hotel).where(or_(Hotel.name.ilike(f"%{target}%"), Hotel.city.ilike(f"%{target}%")))
-        res = await db.execute(q)
-        hotels = res.scalars().all()
-        if not hotels:
+        # Prefer last_hotel_id context over ambiguous 'location'
+        hotel_rows = []
+        if not target and context.get("last_hotel_id"):
+            # Use last recommended hotel id
+            q = select(Hotel).where(Hotel.id == context["last_hotel_id"])
+            res = await db.execute(q)
+            h = res.scalars().first()
+            if not h:
+                return ("I couldn't resolve which hotel you meant. Please specify the hotel name.", context)
+            hotel_rows = [h]
+        else:
+            if not target:
+                # consider 'location' only if it doesn't look like a generic query phrase
+                loc = (context.get("location") or "").strip()
+                loc_l = loc.lower()
+                looks_generic = bool(loc) and ("find" in loc_l or "with" in loc_l)
+                if loc and not looks_generic:
+                    target = loc
+                else:
+                    return ("Which hotel or city would you like to see room types for?", context)
+            q = select(Hotel).where(or_(Hotel.name.ilike(f"%{target}%"), Hotel.city.ilike(f"%{target}%")))
+            res = await db.execute(q)
+            hotel_rows = res.scalars().all()
+        if not hotel_rows:
             return (f"Sorry, I couldn't find any hotels matching '{target}'. Try a different name or city.", context)
         lines = []
         new_ctx = dict(context)
         hotels_info = []
-        for h in hotels:
+        for h_idx, h in enumerate(hotel_rows, start=1):
             rq = select(Room).where(and_(Room.hotel_id == h.id, Room.available == True))
             rres = await db.execute(rq)
             rooms = rres.scalars().all()
             hotels_info.append({"hotel": {"id": h.id, "name": h.name, "city": h.city}, "rooms": [{"id": r.id, "room_type": r.room_type, "price": str(r.price), "available": r.available} for r in rooms]})
-            lines.append(f"{h.name} — {h.city} ({len(rooms)} available rooms)")
-            for r in rooms:
-                lines.append(f"  - {r.room_type}: ${r.price} — {'Available' if r.available else 'Unavailable'}")
+            lines.append(f"{h_idx}. {h.name} — {h.city} ({len(rooms)} available rooms)")
+            for r_idx, r in enumerate(rooms, start=1):
+                lines.append(f"   {r_idx}) {r.room_type} — ${r.price} ({'Available' if r.available else 'Unavailable'})")
             lines.append("")
         new_ctx["last_room_list"] = hotels_info
         text = "Rooms found:\n\n" + "\n".join(lines).strip()
@@ -569,22 +878,44 @@ class AIService:
     async def _handle_hotel_details(self, db: AsyncSession, message: str, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         quoted = re.search(r"\"([^\"]+)\"", message)
         m = re.search(r"(?:about|details about|details for|of)\s+([A-Z0-9][\w\s&'\-]+)", message)
-        target = quoted.group(1).strip() if quoted else (m.group(1).strip() if m else context.get("location"))
-        if not target:
-            return ("Which hotel would you like details for? Please provide hotel name or city.", context)
-        q = select(Hotel).where(or_(Hotel.name.ilike(f"%{target}%"), Hotel.city.ilike(f"%{target}%")))
-        res = await db.execute(q)
-        hotels = res.scalars().all()
-        if not hotels:
+        target = quoted.group(1).strip() if quoted else (m.group(1).strip() if m else None)
+        hotel_rows = []
+        if not target and context.get("last_hotel_id"):
+            q = select(Hotel).where(Hotel.id == context["last_hotel_id"])
+            res = await db.execute(q)
+            h = res.scalars().first()
+            if not h:
+                return ("I couldn't resolve which hotel you meant. Please specify the hotel name.", context)
+            hotel_rows = [h]
+        else:
+            if not target:
+                # consider 'location' only if it doesn't look like a generic query phrase
+                loc = (context.get("location") or "").strip()
+                loc_l = loc.lower()
+                looks_generic = bool(loc) and ("find" in loc_l or "with" in loc_l)
+                if not loc or looks_generic:
+                    return ("Which hotel would you like details for? Please provide hotel name or city.", context)
+                target = loc
+            q = select(Hotel).where(or_(Hotel.name.ilike(f"%{target}%"), Hotel.city.ilike(f"%{target}%")))
+            res = await db.execute(q)
+            hotel_rows = res.scalars().all()
+        if not hotel_rows:
             return (f"Could not find hotel matching '{target}'. Try a different name or a nearby city.", context)
         pieces = []
         new_ctx = dict(context)
         hotel_summaries = []
-        for h in hotels:
-            amenities = ", ".join(h.amenities or []) if h.amenities else "None listed"
-            pieces.append(f"{h.name} — {h.city}\nRating: {float(h.rating or 0):.1f}★\nPrice range: ${h.price_min} - ${h.price_max}\nAmenities: {amenities}\n{h.description or ''}\n")
-            hotel_summaries.append({"id": h.id, "name": h.name, "city": h.city, "rating": float(h.rating or 0)})
+        for idx, h in enumerate(hotel_rows, start=1):
+            amenities = ", ".join(h.amenities or []) if getattr(h, 'amenities', None) else "None listed"
+            pieces.append(
+                f"{idx}. {h.name} — {h.city}\n"
+                f"   - Rating: {float(h.rating or 0):.1f}★\n"
+                f"   - Price range: ${h.price_min} - ${h.price_max}\n"
+                f"   - Amenities: {amenities}\n"
+                f"   - {h.description or ''}\n"
+            )
         new_ctx["last_hotel_details"] = hotel_summaries
+        if hotel_rows:
+            new_ctx['last_hotel_id'] = hotel_rows[0].id
         text = "Hotel details:\n\n" + "\n".join(pieces).strip()
         return (text, new_ctx)
 
@@ -611,6 +942,8 @@ class AIService:
                 working[k] = v
         if target:
             working["hotel_target"] = target
+            # Also set as location so recommendation/lookup can match by name or city
+            working.setdefault("location", target)
         if not (working.get("check_in") and working.get("check_out")):
             return False, {"error": "Missing dates. Please provide check-in and check-out dates (e.g. Oct 22 to Oct 28)."}
         parsed_prefs = working.get("prompt_preferences", {})
@@ -626,3 +959,23 @@ class AIService:
             parsed_prefs.setdefault("Budget", str(working.get("budget_min")))
         await self._update_session(db, chat_session, "User requested booking (parsed)", "(assistant will attempt booking)", {**context, "prompt_preferences": parsed_prefs})
         return await self.book_from_context(db, chat_session.session_id, user_id, preferred_hotel_id=None)
+
+
+# Instantiate a single service for reuse
+ai_service = AIService()
+
+
+@router.post("/message", response_model=ChatResponse)
+async def chat_message(req: ChatMessageRequest, db: AsyncSession = Depends(get_db)):
+    try:
+        return await ai_service.process_message(db, req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/session/{session_id}")
+async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    session = await ai_service.get_session_history(db, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session_id": session.session_id, "messages": session.messages, "context": session.context}

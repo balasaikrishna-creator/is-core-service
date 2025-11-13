@@ -23,6 +23,7 @@ class HotelRecommendation(BaseModel):
     price_range: str
     description: Optional[str] = None
     amenities: Optional[List[str]] = None
+    image_url: Optional[str] = None
 
 
 class ChatResponse(BaseModel):

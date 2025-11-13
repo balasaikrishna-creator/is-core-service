@@ -32,7 +32,14 @@ class BookingService:
 
     @staticmethod
     async def update_booking_by_booking_id(db: AsyncSession, booking_data: BookingUpdate, booking_id: int):
-        query = update(Booking).where(Booking.id == booking_id).values(**booking_data.dict()).returning(Booking)
+        # Only update fields that were provided; avoid setting not-null columns to NULL
+        payload = booking_data.dict(exclude_none=True)
+        query = (
+            update(Booking)
+            .where(Booking.id == booking_id)
+            .values(**payload)
+            .returning(Booking)
+        )
         result = await db.execute(query)
         await db.commit()
         updated_booking = result.scalar_one_or_none()
